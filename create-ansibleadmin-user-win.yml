@@ -1,0 +1,113 @@
+---
+- name: "Create ansibleadmin user"
+  vars_prompt:
+    - name: "new_user_pass"
+      prompt: "Please enter password for new user"
+      private: true
+
+    - name: "new_user_pass_confirm"
+      prompt: "Please confirm password for new user"
+      private: true
+
+  vars:
+    host: "win_servers"
+    remote_admin_desc: "User used by ansible for administrative access to this computer."
+    remote_admin_firstname: "Ansible"
+    remote_admin_displayname: "Ansible Admin"
+    remote_admin_pass: "{{ new_user_pass }}"
+    remote_admin_surname: "Admin"
+    remote_admin_user: "ansibleadmin"
+    # local user's public key to add to new user
+    local_user_name: "{{ local_user | default('ansible') }}"
+    new_user_name: "ansibleadmin"
+    remote_auth_keys_path: "{{ ansible_env.ProgramData }}/ssh/administrators_authorized_keys"
+
+  hosts: "{{ host }}"
+
+  tasks:
+    - name: "Confirm passwords match"
+      ansible.builtin.assert:
+        that:
+          - "new_user_pass == new_user_pass_confirm"
+        fail_msg: "Passwords do not match"
+        quiet: true
+
+    - name: "Create new user"
+      ansible.windows.win_user:
+        account_disabled: false
+        description: "Administrative user used by ansible"
+        fullname: "Ansible Admin"
+        groups:
+          - "Administrators"
+        groups_action: "add"
+        name: "{{ new_user_name }}"
+        password: "{{ new_user_pass }}"
+        password_never_expires: true
+        state: "present"
+        update_password: "always"
+
+    - name: "Get details of user on this controller"
+      become: false
+      delegate_to: "localhost"
+      run_once: true
+      vars:
+        ansible_connection: "local"
+      block:
+        - name: "Get local user's home directory"
+          changed_when: false
+          register: local_user_home
+          ansible.builtin.shell:
+            cmd: |
+              set -o pipefail
+              if uname -s | grep -iqs 'darwin'; then
+                dscl . -list /Users | grep -qsE '^{{ local_user_name }}$' && dscl . -read /Users/{{ local_user_name }} NFSHomeDirectory | awk '{ print $2 }'
+              else
+                awk -F: '$1=="{{ local_user_name }}" { print $6 }' /etc/passwd
+              fi
+
+        - name: "Look for ed25519 key"
+          block:
+            - name: "Get ed25519 public key"
+              ansible.builtin.set_fact:
+                local_pubkey: "{{ lookup('file', local_user_home.stdout~'/.ssh/id_ed25519.pub') }}"
+
+          rescue:
+            - name: "Look for ecdsa key"
+              block:
+                - name: "Get ecdsa public key"
+                  ansible.builtin.set_fact:
+                    local_pubkey: "{{ lookup('file', local_user_home.stdout~'/.ssh/id_ecdsa.pub') }}"
+
+              rescue:
+                - name: "Get rsa public key"
+                  ansible.builtin.set_fact:
+                    local_pubkey: "{{ lookup('file', local_user_home.stdout~'/.ssh/id_rsa.pub') }}"
+
+    - ansible.builtin.set_fact:
+        pubkey_base64: "{{ (local_pubkey).split()[1] }}"
+
+    - name: "Deploy public key of local user to administrators_authorized_keys"
+      community.windows.win_lineinfile:
+        create: true
+        line: "{{ local_pubkey }}"
+        newline: "unix"
+        path: "{{ remote_auth_keys_path }}"
+        regexp: "{{ pubkey_base64 | regex_escape() }}"
+        state: "present"
+
+    - name: "Configure proper permissions for administrators_authorized_keys"
+      ansible.windows.win_acl:
+        path: "{{ remote_auth_keys_path }}"
+        rights: "FullControl"
+        state: "present"
+        type: "allow"
+        user: "{{ item }}"
+      loop:
+        - "BUILTIN\\Administrators"
+        - "NT AUTHORITY\\SYSTEM"
+
+    - name: "Remove inheritence on the administrators_authorized_keys file"
+      ansible.windows.win_acl_inheritance:
+        path: "{{ remote_auth_keys_path }}"
+        reorganize: false
+        state: "absent"
